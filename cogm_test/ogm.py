@@ -1,3 +1,4 @@
+#ogm.py
 from __future__ import annotations
 from typing import List, Tuple, Set, Dict, Any, Iterable
 import numpy as np
@@ -14,7 +15,7 @@ class EdgeAction:
         self.n = tuple(n)
         self.edge_axis = edge_axis  # 'x' | 'y' | 'z'
         self.edge_center = tuple(float(c) for c in edge_center)
-        self.theta_deg = int(theta_deg)  # ±90
+        self.theta_deg = int(theta_deg)  # ±90 or ±180 (depending on config)
         self.end_min_corner = tuple(end_min_corner)
 
     def __repr__(self) -> str:
@@ -22,12 +23,32 @@ class EdgeAction:
                 f"theta={self.theta_deg}, end={self.end_min_corner})")
 
 class OccupancyGridMap:
-    def __init__(self, dims: Tuple[int,int,int], init_modules: Iterable[Vec3], obstacles: Iterable[Vec3] = ()):
+    def __init__(self, dims: Tuple[int,int,int], init_modules: Iterable[Vec3], obstacles: Iterable[Vec3] = (),
+                  infinite_world: bool = False):
         self.dims = tuple(int(x) for x in dims)
         self.modules: Set[Vec3] = set(map(tuple, init_modules))
         self.obstacles: Set[Vec3] = set(map(tuple, obstacles))
+        self.infinite_world = bool(infinite_world)
+    
+    # ---------- windowed observation (NEW) ----------
+    @staticmethod
+    def _fill_window(coords: Iterable[Vec3], origin: Vec3, size: Tuple[int,int,int]) -> np.ndarray:
+        ox, oy, oz = origin
+        X, Y, Z = size
+        g = np.zeros((X, Y, Z), dtype=np.uint8)
+        for (x,y,z) in coords:
+            ix, iy, iz = x - ox, y - oy, z - oz
+            if 0 <= ix < X and 0 <= iy < Y and 0 <= iz < Z:
+                g[ix, iy, iz] = 1
+        return g
 
-    # ---------- basic grids ----------
+    def occupancy_window(self, origin: Vec3, size: Tuple[int,int,int]) -> np.ndarray:
+        return self._fill_window(self.modules, origin, size)
+
+    def goal_window(self, goal_modules: Iterable[Vec3], origin: Vec3, size: Tuple[int,int,int]) -> np.ndarray:
+        return self._fill_window(goal_modules, origin, size)
+
+    # ---------- legacy full-grid builders ----------
     def occupancy_grid(self) -> np.ndarray:
         X,Y,Z = self.dims
         g = np.zeros((X,Y,Z), dtype=np.uint8)
@@ -66,36 +87,22 @@ class OccupancyGridMap:
 
     # ---------- hinge geometry ----------
     def _edge_centers_and_axes(self, m: Vec3, n: Vec3) -> List[Tuple[str, Tuple[float,float,float]]]:
-        """Return hinge edges (axis, center) on the shared face between m and n.
-        If not face-adjacent, returns [].
-        """
         (x,y,z) = m
         (nx,ny,nz) = n
         dx,dy,dz = nx - x, ny - y, nz - z
         centers: List[Tuple[str, Tuple[float,float,float]]] = []
-        # Shared face along +x/-x
         if abs(dx) == 1 and dy == 0 and dz == 0:
-            fx = x + (1 if dx == 1 else 0)  # plane x=fx is the shared face
-            # edges along y: z at z and z+1, y runs -> axis 'y'
-            centers.append(('y', (fx, y+0.5, z+0.0)))
-            centers.append(('y', (fx, y+0.5, z+1.0)))
-            # edges along z: y at y and y+1, z runs -> axis 'z'
-            centers.append(('z', (fx, y+0.0, z+0.5)))
-            centers.append(('z', (fx, y+1.0, z+0.5)))
-        # Shared face along +y/-y
+            fx = x + (1 if dx == 1 else 0)
+            centers += [('y',(fx, y+0.5, z+0.0)), ('y',(fx, y+0.5, z+1.0)),
+                        ('z',(fx, y+0.0, z+0.5)), ('z',(fx, y+1.0, z+0.5))]
         elif abs(dy) == 1 and dx == 0 and dz == 0:
             fy = y + (1 if dy == 1 else 0)
-            centers.append(('x', (x+0.5, fy, z+0.0)))
-            centers.append(('x', (x+0.5, fy, z+1.0)))
-            centers.append(('z', (x+0.0, fy, z+0.5)))
-            centers.append(('z', (x+1.0, fy, z+0.5)))
-        # Shared face along +z/-z
+            centers += [('x',(x+0.5, fy, z+0.0)), ('x',(x+0.5, fy, z+1.0)),
+                        ('z',(x+0.0, fy, z+0.5)), ('z',(x+1.0, fy, z+0.5))]
         elif abs(dz) == 1 and dx == 0 and dy == 0:
             fz = z + (1 if dz == 1 else 0)
-            centers.append(('x', (x+0.5, y+0.0, fz)))
-            centers.append(('x', (x+0.5, y+1.0, fz)))
-            centers.append(('y', (x+0.0, y+0.5, fz)))
-            centers.append(('y', (x+1.0, y+0.5, fz)))
+            centers += [('x',(x+0.5, y+0.0, fz)), ('x',(x+0.5, y+1.0, fz)),
+                        ('y',(x+0.0, y+0.5, fz)), ('y',(x+1.0, y+0.5, fz))]
         return centers
 
     def _rotate_point_about_axis(self, p: Tuple[float,float,float],
@@ -106,17 +113,11 @@ class OccupancyGridMap:
         vx,vy,vz = px-cx, py-cy, pz-cz
         cA, sA = np.cos(ang), np.sin(ang)
         if axis == 'x':
-            vy2 = cA*vy - sA*vz
-            vz2 = sA*vy + cA*vz
-            vx2 = vx
+            vy2 = cA*vy - sA*vz; vz2 = sA*vy + cA*vz; vx2 = vx
         elif axis == 'y':
-            vx2 = cA*vx + sA*vz
-            vz2 = -sA*vx + cA*vz
-            vy2 = vy
+            vx2 = cA*vx + sA*vz; vz2 = -sA*vx + cA*vz; vy2 = vy
         elif axis == 'z':
-            vx2 = cA*vx - sA*vy
-            vy2 = sA*vx + cA*vy
-            vz2 = vz
+            vx2 = cA*vx - sA*vy; vy2 = sA*vx + cA*vy; vz2 = vz
         else:
             raise ValueError("axis must be 'x','y','z'")
         return (cx+vx2, cy+vy2, cz+vz2)
@@ -126,7 +127,6 @@ class OccupancyGridMap:
         verts = [(x+dx, y+dy, z+dz) for dx in (0,1) for dy in (0,1) for dz in (0,1)]
         ang = np.deg2rad(theta_deg)
         rverts = [self._rotate_point_about_axis(v, center, axis, ang) for v in verts]
-        # After 90° rotation, aligned to grid; compute min corner by flooring with small epsilon
         rx = min(v[0] for v in rverts); ry = min(v[1] for v in rverts); rz = min(v[2] for v in rverts)
         eps = 1e-6
         return (int(np.floor(rx+eps)), int(np.floor(ry+eps)), int(np.floor(rz+eps)))
@@ -134,8 +134,6 @@ class OccupancyGridMap:
     # ---------- swept volume ----------
     def swept_volume_reason(self, m: Vec3, axis: str, center: Tuple[float,float,float], theta_deg: int,
                             static_minus_m: Set[Vec3], sweep_steps: int, sweep_points_per_axis: int) -> Tuple[bool,str]:
-        """Return (True,'ok') if clear, else (False, reason)."""
-        # sample interior points of cube m
         x,y,z = m
         eps = 1e-3
         grid = np.linspace(eps, 1.0-eps, sweep_points_per_axis)
@@ -146,21 +144,18 @@ class OccupancyGridMap:
             for p in pts:
                 q = self._rotate_point_about_axis(p, center, axis, ang)
                 ix,iy,iz = int(np.floor(q[0])), int(np.floor(q[1])), int(np.floor(q[2]))
-                if ix < 0 or iy < 0 or iz < 0 or ix >= X or iy >= Y or iz >= Z:
-                    return (False, "mid_rotation_oob")
+                if not self.infinite_world:
+                    if ix < 0 or iy < 0 or iz < 0 or ix >= X or iy >= Y or iz >= Z:
+                        return (False, "mid_rotation_oob")
                 if (ix,iy,iz) in static_minus_m or (ix,iy,iz) in self.obstacles:
                     return (False, "swept_collision")
         return (True, "ok")
 
-    def _swept_volume_clear(self, m: Vec3, axis: str, center: Tuple[float,float,float], theta_deg: int,
-                            static_minus_m: Set[Vec3], sweep_steps: int, sweep_points_per_axis: int) -> bool:
-        ok, _ = self.swept_volume_reason(m, axis, center, theta_deg, static_minus_m, sweep_steps, sweep_points_per_axis)
-        return ok
-
     # ---------- enumeration ----------
-    def enumerate_edge_actions_for_with_reasons(self, m: Vec3, sweep_steps: int = 8, sweep_points_per_axis: int = 3,
-                                                enforce_connectivity: bool = True):
-        """Return (valid_actions, rejections) for module m under shared-face hinges and strict checks."""
+    def enumerate_edge_actions_for_with_reasons(
+        self, m: Vec3, sweep_steps: int = 8, sweep_points_per_axis: int = 3,
+        enforce_connectivity: bool = True, allow_180: bool = True
+    ):
         actions: List[EdgeAction] = []
         rejections: List[Dict[str, Any]] = []
         if m not in self.modules:
@@ -169,15 +164,23 @@ class OccupancyGridMap:
         neighs = self.neighbors_face(m)
         if not neighs:
             return actions, rejections
+
         if enforce_connectivity and not self._connected(static - {m}):
+            rejections.append(dict(mover=m, reason="disconnects_static_without_m"))
             return actions, rejections
+
         for n in neighs:
             for (axis, center) in self._edge_centers_and_axes(m, n):
-                for theta in (+90, -90):
+                thetas = (+90,-90) + ((+180,-180) if allow_180 else ())
+                for theta in thetas:
                     end_c = self._rotated_min_corner(m, axis, center, theta)
+                    if end_c == m:
+                        rejections.append(dict(edge_axis=axis, edge_center=center, theta_deg=theta, reason="end_same_as_start"))
+                        continue
                     X,Y,Z = self.dims
-                    if not (0 <= end_c[0] < X and 0 <= end_c[1] < Y and 0 <= end_c[2] < Z):
-                        rejections.append(dict(edge_axis=axis, edge_center=center, theta_deg=theta, reason="end_oob")); continue
+                    if not self.infinite_world:
+                        if not (0 <= end_c[0] < X and 0 <= end_c[1] < Y and 0 <= end_c[2] < Z):
+                            rejections.append(dict(edge_axis=axis, edge_center=center, theta_deg=theta, reason="end_oob")); continue
                     if end_c in static or end_c in self.obstacles:
                         rejections.append(dict(edge_axis=axis, edge_center=center, theta_deg=theta, reason="end_cell_occupied")); continue
                     static_minus = static - {m}
@@ -192,15 +195,15 @@ class OccupancyGridMap:
         return actions, rejections
 
     def enumerate_edge_actions_for(self, m: Vec3, sweep_steps: int = 8, sweep_points_per_axis: int = 3,
-                                   enforce_connectivity: bool = True) -> List[EdgeAction]:
-        acts, _ = self.enumerate_edge_actions_for_with_reasons(m, sweep_steps, sweep_points_per_axis, enforce_connectivity)
+                                   enforce_connectivity: bool = True, allow_180: bool = True) -> List[EdgeAction]:
+        acts, _ = self.enumerate_edge_actions_for_with_reasons(m, sweep_steps, sweep_points_per_axis, enforce_connectivity, allow_180)
         return acts
 
     def enumerate_edge_actions(self, sweep_steps: int = 8, sweep_points_per_axis: int = 3,
-                               enforce_connectivity: bool = True) -> List[EdgeAction]:
+                               enforce_connectivity: bool = True, allow_180: bool = True) -> List[EdgeAction]:
         out: List[EdgeAction] = []
         for m in sorted(self.modules):
-            out.extend(self.enumerate_edge_actions_for(m, sweep_steps, sweep_points_per_axis, enforce_connectivity))
+            out.extend(self.enumerate_edge_actions_for(m, sweep_steps, sweep_points_per_axis, enforce_connectivity, allow_180))
         return out
 
     # ---------- apply ----------
